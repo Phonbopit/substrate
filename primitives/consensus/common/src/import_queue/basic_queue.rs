@@ -9,14 +9,14 @@
 //
 // 	http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software
+
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
 use std::{mem, pin::Pin, time::Duration, marker::PhantomData};
-use futures::{prelude::*, task::Context, task::Poll};
+use futures::{prelude::*, task::Context, task::Poll, ready};
 use futures_timer::Delay;
 use sp_runtime::{Justification, traits::{Block as BlockT, Header as HeaderT, NumberFor}};
 use sp_utils::mpsc::{TracingUnboundedSender, tracing_unbounded};
@@ -177,7 +177,7 @@ impl<B: BlockT, Transaction: Send> BlockImportWorker<B, Transaction> {
 		let mut worker = BlockImportWorker {
 			result_sender,
 			justification_import,
-			delay_between_blocks: Duration::new(0, 0),
+			delay_between_blocks: Duration::default(),
 			metrics,
 			_phantom: PhantomData,
 		};
@@ -200,28 +200,23 @@ impl<B: BlockT, Transaction: Send> BlockImportWorker<B, Transaction> {
 		let mut block_import_verifier = Some((block_import, verifier));
 		let mut importing = None;
 
-		let future = futures::future::poll_fn(move |cx| {
+		let future = async move {
+			let justification_port = justification_port.fuse();
+			let block_import_port = block_import_port.fuse();
+
 			loop {
 				// If the results sender is closed, that means that the import queue is shutting
 				// down and we should end this future.
 				if worker.result_sender.is_closed() {
-					return Poll::Ready(())
+					return;
 				}
 
-				// Grab the next justification import request sent to the import queue.
-				match Stream::poll_next(Pin::new(&mut justification_port), cx) {
-					Poll::Ready(Some(ImportJustification(who, hash, number, justification))) => {
-						worker.import_justification(who, hash, number, justification);
-						continue;
-					},
-					Poll::Ready(None) => return Poll::Ready(()),
-					Poll::Pending => {},
-				};
-
+				let import_block = async {
 				// If we are in the process of importing a bunch of blocks, let's resume this
 				// process before doing anything more.
 				if let Some(imp_fut) = importing.as_mut() {
-					match Future::poll(Pin::new(imp_fut), cx) {
+					imp_fut.await
+					match futures::poll!(imp_fut) {
 						Poll::Pending => return Poll::Pending,
 						Poll::Ready((bi, verif)) => {
 							block_import_verifier = Some((bi, verif));
@@ -235,9 +230,9 @@ impl<B: BlockT, Transaction: Send> BlockImportWorker<B, Transaction> {
 
 				// Grab the next block import request sent to the import queue.
 				let ImportBlocks(origin, blocks) =
-					match Stream::poll_next(Pin::new(&mut block_import_port), cx) {
+					match poll!(block_import_port.poll()) {
 						Poll::Ready(Some(msg)) => msg,
-						Poll::Ready(None) => return Poll::Ready(()),
+						Poll::Ready(None) => return,
 						Poll::Pending => return Poll::Pending,
 					};
 
@@ -248,6 +243,17 @@ impl<B: BlockT, Transaction: Send> BlockImportWorker<B, Transaction> {
 					.expect("block_import_verifier is always Some; qed");
 
 				importing = Some(worker.import_batch(block_import, verifier, origin, blocks));
+				};
+
+				while let Poll::Ready(justification) = futures::poll!(justification_port.next()) {
+					match justification {
+						Some(ImportJustification(who, hash, number, justification)) =>
+							worker.import_justification(who, hash, number, justification),
+						None => return,
+					}
+				}
+
+
 			}
 		});
 
@@ -270,9 +276,9 @@ impl<B: BlockT, Transaction: Send> BlockImportWorker<B, Transaction> {
 		let metrics = self.metrics.clone();
 
 		import_many_blocks(block_import, origin, blocks, verifier, self.delay_between_blocks, metrics)
-			.then(move |(imported, count, results, block_import, verifier)| {
+			.then(move |(imported, count, results, block_import, verifier)| async move {
 				result_sender.blocks_processed(imported, count, results);
-				future::ready((block_import, verifier))
+				(block_import, verifier)
 			})
 	}
 
@@ -314,22 +320,20 @@ impl<B: BlockT, Transaction: Send> BlockImportWorker<B, Transaction> {
 ///
 /// The returned `Future` yields at every imported block, which makes the execution more
 /// fine-grained and making it possible to interrupt the process.
-fn import_many_blocks<B: BlockT, V: Verifier<B>, Transaction>(
-	import_handle: BoxBlockImport<B, Transaction>,
+async fn import_many_blocks<B: BlockT, V: Verifier<B>, Transaction>(
+	mut import_handle: BoxBlockImport<B, Transaction>,
 	blocks_origin: BlockOrigin,
 	blocks: Vec<IncomingBlock<B>>,
-	verifier: V,
+	mut verifier: V,
 	delay_between_blocks: Duration,
 	metrics: Option<Metrics>,
-) -> impl Future<
-	Output = (
-		usize,
-		usize,
-		Vec<(Result<BlockImportResult<NumberFor<B>>, BlockImportError>, B::Hash)>,
-		BoxBlockImport<B, Transaction>,
-		V,
-	),
-> {
+) -> (
+	usize,
+	usize,
+	Vec<(Result<BlockImportResult<NumberFor<B>>, BlockImportError>, B::Hash)>,
+	BoxBlockImport<B, Transaction>,
+	V,
+) {
 	let count = blocks.len();
 
 	let blocks_range = match (
@@ -347,43 +351,17 @@ fn import_many_blocks<B: BlockT, V: Verifier<B>, Transaction>(
 	let mut results = vec![];
 	let mut has_error = false;
 	let mut blocks = blocks.into_iter();
-	let mut import_handle = Some(import_handle);
-	let mut waiting = None;
-	let mut verifier = Some(verifier);
 
 	// Blocks in the response/drain should be in ascending order.
-
-	future::poll_fn(move |cx| {
-		// Handle the optional timer that makes us wait before the next import.
-		if let Some(waiting) = &mut waiting {
-			match Future::poll(Pin::new(waiting), cx) {
-				Poll::Ready(_) => {},
-				Poll::Pending => return Poll::Pending,
-			}
-		}
-		waiting = None;
-
+	loop {
 		// Is there any block left to import?
 		let block = match blocks.next() {
 			Some(b) => b,
 			None => {
 				// No block left to import, success!
-				let import_handle = import_handle.take()
-					.expect("Future polled again after it has finished (import handle is None)");
-				let verifier = verifier.take()
-					.expect("Future polled again after it has finished (verifier handle is None)");
-				let results = mem::replace(&mut results, Vec::new());
-				return Poll::Ready((imported, count, results, import_handle, verifier));
+				return (imported, count, results, import_handle, verifier);
 			},
 		};
-
-		// We extract the content of `import_handle` and `verifier` only when the future ends,
-		// therefore `import_handle` and `verifier` are always `Some` here. It is illegal to poll
-		// a `Future` again after it has ended.
-		let import_handle = import_handle.as_mut()
-			.expect("Future polled again after it has finished (import handle is None)");
-		let verifier = verifier.as_mut()
-			.expect("Future polled again after it has finished (verifier handle is None)");
 
 		let block_number = block.header.as_ref().map(|h| h.number().clone());
 		let block_hash = block.hash;
@@ -392,12 +370,12 @@ fn import_many_blocks<B: BlockT, V: Verifier<B>, Transaction>(
 		} else {
 			// The actual import.
 			import_single_block_metered(
-				&mut **import_handle,
+				&mut import_handle,
 				blocks_origin.clone(),
 				block,
-				verifier,
+				&mut verifier,
 				metrics.clone(),
-			)
+			).await
 		};
 
 		if let Some(metrics) = metrics.as_ref() {
@@ -405,7 +383,12 @@ fn import_many_blocks<B: BlockT, V: Verifier<B>, Transaction>(
 		}
 
 		if import_result.is_ok() {
-			trace!(target: "sync", "Block imported successfully {:?} ({})", block_number, block_hash);
+			trace!(
+				target: "sync",
+				"Block imported successfully {:?} ({})",
+				block_number,
+				block_hash,
+			);
 			imported += 1;
 		} else {
 			has_error = true;
@@ -413,14 +396,10 @@ fn import_many_blocks<B: BlockT, V: Verifier<B>, Transaction>(
 
 		results.push((import_result, block_hash));
 
-		// Notifies the current task again so that we re-execute this closure again for the next
-		// block.
-		if delay_between_blocks != Duration::new(0, 0) {
-			waiting = Some(Delay::new(delay_between_blocks));
+		if delay_between_blocks != Duration::default() && !has_error {
+			Delay::new(delay_between_blocks).await;
 		}
-		cx.waker().wake_by_ref();
-		Poll::Pending
-	})
+	}
 }
 
 #[cfg(test)]
